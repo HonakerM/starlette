@@ -6,12 +6,13 @@ from enum import Enum
 from tempfile import SpooledTemporaryFile
 from urllib.parse import unquote_plus
 
+from multipart import MultipartSegment, PushMultipartParser, parse_options_header
+
 from starlette.datastructures import FormData, Headers, UploadFile
-from multipart import PushMultipartParser, MultipartSegment, parse_options_header
 
 if typing.TYPE_CHECKING:
     import python_multipart as multipart
-    from python_multipart.multipart import MultipartCallbacks, QuerystringCallbacks
+    from python_multipart.multipart import QuerystringCallbacks
 else:
     try:
         try:
@@ -145,57 +146,14 @@ class MultiPartParser:
         self.items: list[tuple[str, str | UploadFile]] = []
         self._current_files = 0
         self._current_fields = 0
-        self._current_partial_header_name: bytes = b""
-        self._current_partial_header_value: bytes = b""
-        self._current_part = MultipartPart()
         self._charset = ""
-        self._file_parts_to_write: list[tuple[MultipartPart, bytes]] = []
-        self._file_parts_to_finish: list[MultipartPart] = []
         self._files_to_close_on_error: list[SpooledTemporaryFile[bytes]] = []
         self.max_part_size = max_part_size
 
-    async def on_part_begin(self) -> None:
-        self._current_part = MultipartPart()
-
-    async def on_part_data(self, data: bytes, start: int, end: int) -> None:
-        message_bytes = data[start:end]
-        if self._current_part.file is None:
-            if len(self._current_part.data) + len(message_bytes) > self.max_part_size:
-                raise MultiPartException(f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
-            self._current_part.data.extend(message_bytes)
-        else:
-            await self._current_part.file.write(message_bytes)
-
-    async def on_part_end(self) -> None:
-        if self._current_part.file is None:
-            self.items.append(
-                (
-                    self._current_part.field_name,
-                    _user_safe_decode(self._current_part.data, self._charset),
-                )
-            )
-        else:
-            await self._current_part.file.seek(0)
-            self.items.append((self._current_part.field_name, self._current_part.file))
-
-    async def on_header_field(self, data: bytes, start: int, end: int) -> None:
-        self._current_partial_header_name += data[start:end]
-
-    async def on_header_value(self, data: bytes, start: int, end: int) -> None:
-        self._current_partial_header_value += data[start:end]
-
-    async def on_header_end(self) -> None:
-        field = self._current_partial_header_name.lower()
-        if field == b"content-disposition":
-            self._current_part.content_disposition = self._current_partial_header_value
-        self._current_part.item_headers.append((field, self._current_partial_header_value))
-        self._current_partial_header_name = b""
-        self._current_partial_header_value = b""
-
-    async def on_headers_finished(self) -> None:
-        disposition, options = parse_options_header(self._current_part.content_disposition)
+    async def on_headers_finished(self, current_part: MultipartPart) -> None:
+        disposition, options = parse_options_header(current_part.content_disposition)
         try:
-            self._current_part.field_name = _user_safe_decode(options[b"name"], self._charset)
+            current_part.field_name = _user_safe_decode(options[b"name"], self._charset)
         except KeyError:
             raise MultiPartException('The Content-Disposition header field "name" must be provided.')
         if b"filename" in options:
@@ -205,20 +163,17 @@ class MultiPartParser:
             filename = _user_safe_decode(options[b"filename"], self._charset)
             tempfile = SpooledTemporaryFile(max_size=self.spool_max_size)
             self._files_to_close_on_error.append(tempfile)
-            self._current_part.file = UploadFile(
+            current_part.file = UploadFile(
                 file=tempfile,  # type: ignore[arg-type]
                 size=0,
                 filename=filename,
-                headers=Headers(raw=self._current_part.item_headers),
+                headers=Headers(raw=current_part.item_headers),
             )
         else:
             self._current_fields += 1
             if self._current_fields > self.max_fields:
                 raise MultiPartException(f"Too many fields. Maximum number of fields is {self.max_fields}.")
-            self._current_part.file = None
-
-    async def on_end(self) -> None:
-        pass
+            current_part.file = None
 
     async def parse(self) -> FormData:
         # Parse the Content-Type header to get the multipart boundary.
@@ -232,22 +187,52 @@ class MultiPartParser:
         except KeyError:
             raise MultiPartException("Missing boundary in multipart.")
 
+        try:
+            return await self.parse_internal(boundary)
+        except MultiPartException as exc:
+            for file in self._files_to_close_on_error:
+                file.close()
+            raise exc
+
+    async def parse_internal(self, boundary: str) -> FormData:
         current_part = None
-        with PushMultipartParser(boundary) as parser:
+        with PushMultipartParser(
+            boundary,
+            header_charset=self._charset,
+        ) as parser:
             while not parser.closed:
                 chunk = await self.stream.__anext__()
                 for result in parser.parse(chunk):
                     if isinstance(result, MultipartSegment):
-                        await self.on_part_begin()
-                        for header, value in result.headerlist:
-                            await self.on_header_field(header.encode("utf-8"), 0, len(header))
-                            await self.on_header_value(value.encode("utf-8"), 0, len(value))
-                            await self.on_header_end()
-                        await self.on_headers_finished()
-                    elif result:  # Non-empty bytearray
-                        await self.on_part_data(result, 0, len(result))
-                    else:         # None
-                        await self.on_part_end()
+                        result_charset = result.charset or self._charset
 
-            await self.on_end()
+                        current_part = MultipartPart()
+                        for header, value in result.headerlist:
+                            parsed_header = header.lower().encode(result_charset)
+                            parsed_value = value.encode(result_charset)
+                            if parsed_header == b"content-disposition":
+                                current_part.content_disposition = parsed_value
+                            current_part.item_headers.append((parsed_header, parsed_value))
+                        await self.on_headers_finished(current_part)
+                    elif result:  # Non-empty bytearray
+                        if current_part.file is None:
+                            if len(current_part.data) + len(result) > self.max_part_size:
+                                raise MultiPartException(
+                                    f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB."
+                                )
+                            current_part.data.extend(result)
+                        else:
+                            await current_part.file.write(result)
+                    else:  # Segment End
+                        if current_part.file is None:
+                            self.items.append(
+                                (
+                                    current_part.field_name,
+                                    _user_safe_decode(current_part.data, self._charset),
+                                )
+                            )
+                        else:
+                            await current_part.file.seek(0)
+                            self.items.append((current_part.field_name, current_part.file))
+
         return FormData(self.items)
