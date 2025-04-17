@@ -7,10 +7,11 @@ from tempfile import SpooledTemporaryFile
 from urllib.parse import unquote_plus
 
 from starlette.datastructures import FormData, Headers, UploadFile
+from multipart import PushMultipartParser, MultipartSegment, parse_options_header
 
 if typing.TYPE_CHECKING:
     import python_multipart as multipart
-    from python_multipart.multipart import MultipartCallbacks, QuerystringCallbacks, parse_options_header
+    from python_multipart.multipart import MultipartCallbacks, QuerystringCallbacks
 else:
     try:
         try:
@@ -153,19 +154,19 @@ class MultiPartParser:
         self._files_to_close_on_error: list[SpooledTemporaryFile[bytes]] = []
         self.max_part_size = max_part_size
 
-    def on_part_begin(self) -> None:
+    async def on_part_begin(self) -> None:
         self._current_part = MultipartPart()
 
-    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+    async def on_part_data(self, data: bytes, start: int, end: int) -> None:
         message_bytes = data[start:end]
         if self._current_part.file is None:
             if len(self._current_part.data) + len(message_bytes) > self.max_part_size:
                 raise MultiPartException(f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
             self._current_part.data.extend(message_bytes)
         else:
-            self._file_parts_to_write.append((self._current_part, message_bytes))
+            await self._current_part.file.write(message_bytes)
 
-    def on_part_end(self) -> None:
+    async def on_part_end(self) -> None:
         if self._current_part.file is None:
             self.items.append(
                 (
@@ -174,19 +175,16 @@ class MultiPartParser:
                 )
             )
         else:
-            self._file_parts_to_finish.append(self._current_part)
-            # The file can be added to the items right now even though it's not
-            # finished yet, because it will be finished in the `parse()` method, before
-            # self.items is used in the return value.
+            await self._current_part.file.seek(0)
             self.items.append((self._current_part.field_name, self._current_part.file))
 
-    def on_header_field(self, data: bytes, start: int, end: int) -> None:
+    async def on_header_field(self, data: bytes, start: int, end: int) -> None:
         self._current_partial_header_name += data[start:end]
 
-    def on_header_value(self, data: bytes, start: int, end: int) -> None:
+    async def on_header_value(self, data: bytes, start: int, end: int) -> None:
         self._current_partial_header_value += data[start:end]
 
-    def on_header_end(self) -> None:
+    async def on_header_end(self) -> None:
         field = self._current_partial_header_name.lower()
         if field == b"content-disposition":
             self._current_part.content_disposition = self._current_partial_header_value
@@ -194,7 +192,7 @@ class MultiPartParser:
         self._current_partial_header_name = b""
         self._current_partial_header_value = b""
 
-    def on_headers_finished(self) -> None:
+    async def on_headers_finished(self) -> None:
         disposition, options = parse_options_header(self._current_part.content_disposition)
         try:
             self._current_part.field_name = _user_safe_decode(options[b"name"], self._charset)
@@ -219,7 +217,7 @@ class MultiPartParser:
                 raise MultiPartException(f"Too many fields. Maximum number of fields is {self.max_fields}.")
             self._current_part.file = None
 
-    def on_end(self) -> None:
+    async def on_end(self) -> None:
         pass
 
     async def parse(self) -> FormData:
@@ -234,42 +232,22 @@ class MultiPartParser:
         except KeyError:
             raise MultiPartException("Missing boundary in multipart.")
 
-        # Callbacks dictionary.
-        callbacks: MultipartCallbacks = {
-            "on_part_begin": self.on_part_begin,
-            "on_part_data": self.on_part_data,
-            "on_part_end": self.on_part_end,
-            "on_header_field": self.on_header_field,
-            "on_header_value": self.on_header_value,
-            "on_header_end": self.on_header_end,
-            "on_headers_finished": self.on_headers_finished,
-            "on_end": self.on_end,
-        }
+        current_part = None
+        with PushMultipartParser(boundary) as parser:
+            while not parser.closed:
+                chunk = await self.stream.__anext__()
+                for result in parser.parse(chunk):
+                    if isinstance(result, MultipartSegment):
+                        await self.on_part_begin()
+                        for header, value in result.headerlist:
+                            await self.on_header_field(header.encode("utf-8"), 0, len(header))
+                            await self.on_header_value(value.encode("utf-8"), 0, len(value))
+                            await self.on_header_end()
+                        await self.on_headers_finished()
+                    elif result:  # Non-empty bytearray
+                        await self.on_part_data(result, 0, len(result))
+                    else:         # None
+                        await self.on_part_end()
 
-        # Create the parser.
-        parser = multipart.MultipartParser(boundary, callbacks)
-        try:
-            # Feed the parser with data from the request.
-            async for chunk in self.stream:
-                parser.write(chunk)
-                # Write file data, it needs to use await with the UploadFile methods
-                # that call the corresponding file methods *in a threadpool*,
-                # otherwise, if they were called directly in the callback methods above
-                # (regular, non-async functions), that would block the event loop in
-                # the main thread.
-                for part, data in self._file_parts_to_write:
-                    assert part.file  # for type checkers
-                    await part.file.write(data)
-                for part in self._file_parts_to_finish:
-                    assert part.file  # for type checkers
-                    await part.file.seek(0)
-                self._file_parts_to_write.clear()
-                self._file_parts_to_finish.clear()
-        except MultiPartException as exc:
-            # Close all the files if there was an error.
-            for file in self._files_to_close_on_error:
-                file.close()
-            raise exc
-
-        parser.finalize()
+            await self.on_end()
         return FormData(self.items)
