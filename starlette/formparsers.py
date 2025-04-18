@@ -7,6 +7,7 @@ from tempfile import SpooledTemporaryFile
 from urllib.parse import unquote_plus
 
 from multipart import MultipartSegment, PushMultipartParser, parse_options_header
+from urllib.parse import parse_qsl
 
 from starlette.datastructures import FormData, Headers, UploadFile
 
@@ -150,6 +151,42 @@ class MultiPartParser:
         self._files_to_close_on_error: list[SpooledTemporaryFile[bytes]] = []
         self.max_part_size = max_part_size
 
+    async def on_part_begin(self, result: MultipartSegment)->MultipartPart:
+        result_charset = result.charset or self._charset
+
+        current_part = MultipartPart()
+        for header, value in result.headerlist:
+            parsed_header = header.lower().encode(result_charset)
+            parsed_value = value.encode(result_charset)
+            if parsed_header == b"content-disposition":
+                current_part.content_disposition = parsed_value
+            current_part.item_headers.append((parsed_header, parsed_value))
+        await self.on_headers_finished(current_part)
+        
+        return current_part
+
+    async def on_part_data(self, part: MultipartPart, data: bytes) -> None:
+        if part.file is None:
+            if len(part.data) + len(data) > self.max_part_size:
+                raise MultiPartException(
+                    f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB."
+                )
+            part.data.extend(data)
+        else:
+            await part.file.write(data)
+
+    async def on_part_end(self, part: MultipartPart)->MultipartPart:
+        if part.file is None:
+            self.items.append(
+                (
+                    part.field_name,
+                    _user_safe_decode(part.data, self._charset),
+                )
+            )
+        else:
+            await part.file.seek(0)
+            self.items.append((part.field_name, part.file))
+ 
     async def on_headers_finished(self, current_part: MultipartPart) -> None:
         disposition, options = parse_options_header(current_part.content_disposition)
         try:
@@ -204,35 +241,10 @@ class MultiPartParser:
                 chunk = await self.stream.__anext__()
                 for result in parser.parse(chunk):
                     if isinstance(result, MultipartSegment):
-                        result_charset = result.charset or self._charset
-
-                        current_part = MultipartPart()
-                        for header, value in result.headerlist:
-                            parsed_header = header.lower().encode(result_charset)
-                            parsed_value = value.encode(result_charset)
-                            if parsed_header == b"content-disposition":
-                                current_part.content_disposition = parsed_value
-                            current_part.item_headers.append((parsed_header, parsed_value))
-                        await self.on_headers_finished(current_part)
+                        current_part = await self.on_part_begin(result)
                     elif result:  # Non-empty bytearray
-                        if current_part.file is None:
-                            if len(current_part.data) + len(result) > self.max_part_size:
-                                raise MultiPartException(
-                                    f"Part exceeded maximum size of {int(self.max_part_size / 1024)}KB."
-                                )
-                            current_part.data.extend(result)
-                        else:
-                            await current_part.file.write(result)
+                        await self.on_part_data(current_part, result)
                     else:  # Segment End
-                        if current_part.file is None:
-                            self.items.append(
-                                (
-                                    current_part.field_name,
-                                    _user_safe_decode(current_part.data, self._charset),
-                                )
-                            )
-                        else:
-                            await current_part.file.seek(0)
-                            self.items.append((current_part.field_name, current_part.file))
+                        await self.on_part_end(current_part)
 
         return FormData(self.items)
