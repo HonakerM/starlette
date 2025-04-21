@@ -6,8 +6,10 @@ from enum import Enum
 from tempfile import SpooledTemporaryFile
 from urllib.parse import unquote_plus
 
+from starlette.concurrency import run_in_threadpool
 from multipart import MultipartSegment, PushMultipartParser, parse_options_header
 from urllib.parse import parse_qsl
+import anyio.from_thread
 
 from starlette.datastructures import FormData, Headers, UploadFile
 
@@ -151,7 +153,7 @@ class MultiPartParser:
         self._files_to_close_on_error: list[SpooledTemporaryFile[bytes]] = []
         self.max_part_size = max_part_size
 
-    async def on_part_begin(self, result: MultipartSegment)->MultipartPart:
+    def on_part_begin(self, result: MultipartSegment)->MultipartPart:
         result_charset = result.charset or self._charset
 
         current_part = MultipartPart()
@@ -161,11 +163,11 @@ class MultiPartParser:
             if parsed_header == b"content-disposition":
                 current_part.content_disposition = parsed_value
             current_part.item_headers.append((parsed_header, parsed_value))
-        await self.on_headers_finished(current_part)
+        self.on_headers_finished(current_part)
         
         return current_part
 
-    async def on_part_data(self, part: MultipartPart, data: bytes) -> None:
+    def on_part_data(self, part: MultipartPart, data: bytes) -> None:
         if part.file is None:
             if len(part.data) + len(data) > self.max_part_size:
                 raise MultiPartException(
@@ -173,9 +175,9 @@ class MultiPartParser:
                 )
             part.data.extend(data)
         else:
-            await part.file.write(data)
+            part.file.file.write(data)
 
-    async def on_part_end(self, part: MultipartPart)->MultipartPart:
+    def on_part_end(self, part: MultipartPart)->MultipartPart:
         if part.file is None:
             self.items.append(
                 (
@@ -184,10 +186,10 @@ class MultiPartParser:
                 )
             )
         else:
-            await part.file.seek(0)
+            part.file.file.seek(0)
             self.items.append((part.field_name, part.file))
  
-    async def on_headers_finished(self, current_part: MultipartPart) -> None:
+    def on_headers_finished(self, current_part: MultipartPart) -> None:
         disposition, options = parse_options_header(current_part.content_disposition)
         try:
             current_part.field_name = _user_safe_decode(options[b"name"], self._charset)
@@ -225,26 +227,30 @@ class MultiPartParser:
             raise MultiPartException("Missing boundary in multipart.")
 
         try:
-            return await self.parse_internal(boundary)
+            return await run_in_threadpool(self.parse_internal, boundary)
         except MultiPartException as exc:
             for file in self._files_to_close_on_error:
                 file.close()
             raise exc
 
-    async def parse_internal(self, boundary: str) -> FormData:
+    def parse_internal(self, boundary: str) -> FormData:
         current_part = None
         with PushMultipartParser(
             boundary,
             header_charset=self._charset,
         ) as parser:
             while not parser.closed:
-                chunk = await self.stream.__anext__()
+                try:
+                    chunk = anyio.from_thread.run(self.stream.__anext__)
+                except StopAsyncIteration:
+                    break
+
                 for result in parser.parse(chunk):
                     if isinstance(result, MultipartSegment):
-                        current_part = await self.on_part_begin(result)
+                        current_part = self.on_part_begin(result)
                     elif result:  # Non-empty bytearray
-                        await self.on_part_data(current_part, result)
+                        self.on_part_data(current_part, result)
                     else:  # Segment End
-                        await self.on_part_end(current_part)
+                        self.on_part_end(current_part)
 
         return FormData(self.items)
